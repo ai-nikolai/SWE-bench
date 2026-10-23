@@ -31,6 +31,7 @@ from swebench.harness.docker_utils import (
     copy_to_container,
     exec_run_with_timeout,
 )
+from swebench.harness.container_backends import get_backend
 import logging
 from swebench.harness.grading import get_eval_report
 from swebench.harness.reporting import make_run_report
@@ -80,7 +81,7 @@ def create_container(
 
     Args:
         test_spec (TestSpec): Test spec with evaluation details
-        client (docker.DockerClient): Docker client for creating the container
+        backend: container backend (``docker`` or ``apptainer``)
         run_id (str): Run ID identifying process, used for the container name
         logger (logging.Logger): Logger to use for logging the creation process
     """
@@ -169,7 +170,12 @@ def _resolve_asset_bytes(asset: dict, task_repo: str | None, logger) -> bytes | 
 
 
 def _stage_image_assets(
-    container, test_spec, log_dir: Path, logger, task_repo: str | None = None
+    container,
+    test_spec,
+    log_dir: Path,
+    logger,
+    task_repo: str | None = None,
+    backend=None,
 ) -> list[str]:
     """Stage a patch's binary assets in the container; return restore commands.
 
@@ -203,7 +209,9 @@ def _stage_image_assets(
         flat = asset["path"].replace("/", "__")
         local = staging / flat
         local.write_bytes(data)
-        copy_to_container(container, local, PurePosixPath("/image_assets") / flat)
+        copy = backend.copy if backend is not None else (
+            lambda c, src, dst: copy_to_container(c, src, dst))
+        copy(container, local, PurePosixPath("/image_assets") / flat)
         restore.append(
             f"mkdir -p $(dirname {asset['path']}) && cp /image_assets/{flat} {asset['path']}"
         )
@@ -229,7 +237,7 @@ def _inject_asset_restore(eval_script: str, restore_cmds: list[str]) -> str:
 def run_instance(
     test_spec: TestSpec,
     pred: dict,
-    client: docker.DockerClient,
+    backend,
     run_id: str,
     timeout: int | None = None,
     rewrite_reports: bool = False,
@@ -281,7 +289,7 @@ def run_instance(
     container = None
     try:
         # Create container from image
-        container = create_container(test_spec, client, run_id, logger)
+        container = backend.create(test_spec, run_id, logger)
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
 
@@ -292,9 +300,7 @@ def run_instance(
             logger.info(
                 f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
             )
-            copy_to_container(
-                container, patch_file, PurePosixPath(CONTAINER_PATCH_FILE)
-            )
+            backend.copy(container, patch_file, PurePosixPath(CONTAINER_PATCH_FILE))
 
             # Attempt to apply patch to container
             applied_patch = False
@@ -353,7 +359,7 @@ def run_instance(
         # them as urls in image_assets; without this the tests run against a
         # missing baseline and error out.
         restore_cmds = _stage_image_assets(
-            container, test_spec, log_dir, logger, task_repo
+            container, test_spec, log_dir, logger, task_repo, backend
         )
 
         eval_file = Path(log_dir / "eval.sh")
@@ -361,10 +367,10 @@ def run_instance(
         logger.info(
             f"Eval script for {instance_id} written to {eval_file}; copying to container..."
         )
-        copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
+        backend.copy(container, eval_file, PurePosixPath("/eval.sh"))
 
         # Run eval script, write output to logs
-        test_output, timed_out, total_runtime = exec_run_with_timeout(
+        test_output, timed_out, total_runtime = backend.exec_with_timeout(
             container, "/bin/bash /eval.sh", timeout
         )
         test_output_path = log_dir / LOG_TEST_OUTPUT
@@ -424,7 +430,7 @@ def run_instance(
         logger.error(error_msg)
     finally:
         # Remove instance container + image, close logger
-        cleanup_container(client, container, logger)
+        backend.cleanup(container, logger)
         close_logger(logger)
     return
 
@@ -438,6 +444,7 @@ def run_instances(
     rewrite_reports: bool = False,
     skip_patch: bool = False,
     task_repo: str | None = None,
+    backend=None,
 ):
     """
     Run all instances for the given predictions in parallel.
@@ -451,7 +458,7 @@ def run_instances(
         timeout (int): Timeout for running tests
         rewrite_reports (bool): True if eval run is just to reformat existing report
     """
-    client = _docker_client()
+    backend = backend if backend is not None else get_backend("docker")
     test_specs = [make_test_spec(instance) for instance in instances]
 
     # run instances in parallel
@@ -461,7 +468,7 @@ def run_instances(
             (
                 test_spec,
                 predictions[test_spec.instance_id],
-                client,
+                backend,
                 run_id,
                 timeout,
                 rewrite_reports,
@@ -708,6 +715,9 @@ def main(
     rewrite_reports: bool,
     modal: bool,
     task_repo: str | None = None,
+    backend: str = "docker",
+    sif_cache: str | None = None,
+    apptainer_bin: str | None = None,
 ):
     """
     Run evaluation harness for the given dataset and predictions.
@@ -761,7 +771,14 @@ def main(
     # run instances locally
     if platform.system() == "Linux":
         resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
-    client = _docker_client()
+    backend_impl = get_backend(
+        backend,
+        **({"sif_cache": sif_cache, "binary": apptainer_bin}
+           if backend == "apptainer" else {}),
+    )
+    # Only the Docker backend needs a client; the report tolerates None and simply
+    # skips its "containers still running" section.
+    client = _docker_client() if backend == "docker" else None
 
     if not dataset:
         print("No instances to run.")
@@ -769,7 +786,7 @@ def main(
     else:
         # a re-grade reads existing logs and starts no container, so building the
         # images it names would cost hours and change nothing
-        if task_repo and not rewrite_reports:
+        if task_repo and not rewrite_reports and backend == "docker":
             _build_before_eval(
                 dataset, dataset_name, split, task_repo, max_workers, client
             )
@@ -782,6 +799,7 @@ def main(
             timeout,
             rewrite_reports=rewrite_reports,
             task_repo=task_repo,
+            backend=backend_impl,
         )
 
     # make final report
@@ -848,6 +866,25 @@ if __name__ == "__main__":
     )
     # Modal execution args
     parser.add_argument("--modal", type=str2bool, default=False, help="Run on Modal")
+    parser.add_argument(
+        "--backend",
+        choices=("docker", "apptainer"),
+        default="docker",
+        help="How instance containers are run. `apptainer` needs no Docker daemon.",
+    )
+    parser.add_argument(
+        "--sif-cache",
+        type=str,
+        default=None,
+        help="Where the apptainer backend caches instance .sif images "
+        "(default: $SWEBENCH_SIF_CACHE or ~/.cache/swebench/sif)",
+    )
+    parser.add_argument(
+        "--apptainer-bin",
+        type=str,
+        default=None,
+        help="apptainer/singularity binary to use for the apptainer backend",
+    )
 
     args = parser.parse_args()
     main(**vars(args))
